@@ -1,0 +1,324 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WebAuthn Tester</title>
+<style>
+  :root { --bg:#fff; --fg:#1a1a1a; --muted:#666; --card:#f4f5f7; --line:#d6d9de; --accent:#2563eb; --ok:#15803d; --bad:#b91c1c; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#111418; --fg:#e8eaed; --muted:#9aa0a6; --card:#1b1f25; --line:#2d333b; --accent:#6ea8fe; --ok:#4ade80; --bad:#f87171; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; padding:16px; background:var(--bg); color:var(--fg); font:16px/1.45 -apple-system, system-ui, Segoe UI, Roboto, sans-serif; max-width:720px; margin-inline:auto; }
+  h1 { font-size:1.3rem; margin:0 0 4px; }
+  p.sub { margin:0 0 16px; color:var(--muted); font-size:.9rem; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:14px; margin-bottom:14px; }
+  .card h2 { font-size:1rem; margin:0 0 10px; }
+  label { display:block; font-size:.85rem; color:var(--muted); margin:10px 0 4px; }
+  select, input[type=number] { width:100%; padding:10px; font-size:16px; border-radius:8px; border:1px solid var(--line); background:var(--bg); color:var(--fg); }
+  .row { display:flex; gap:8px; flex-wrap:wrap; }
+  button { padding:11px 14px; font-size:16px; border-radius:10px; border:1px solid var(--line); background:var(--bg); color:var(--fg); cursor:pointer; }
+  button.primary { background:var(--accent); color:#fff; border-color:var(--accent); font-weight:600; }
+  button:disabled { opacity:.5; }
+  .check { display:flex; align-items:center; gap:8px; margin-top:10px; font-size:.95rem; }
+  .check input { width:20px; height:20px; }
+  #status { font-weight:600; min-height:1.4em; }
+  #status.ok { color:var(--ok); } #status.bad { color:var(--bad); }
+  pre { margin:0; white-space:pre-wrap; word-break:break-word; font:12.5px/1.45 ui-monospace, Menlo, Consolas, monospace; }
+  .env { font-size:.8rem; color:var(--muted); }
+</style>
+</head>
+<body>
+<h1>WebAuthn Tester</h1>
+<p class="sub">Registers and authenticates a passkey or security key, then decodes what came back and how long it took. Runs entirely in your browser; nothing is sent anywhere.</p>
+
+<div class="card">
+  <h2>Presets</h2>
+  <div class="row">
+    <button onclick="preset('google')">Google-like</button>
+    <button onclick="preset('microsoft')">Resident + PIN</button>
+    <button onclick="preset('minimal')">Minimal</button>
+  </div>
+</div>
+
+<div class="card">
+  <h2>Registration options</h2>
+  <label for="attestation">attestation</label>
+  <select id="attestation">
+    <option>none</option><option>indirect</option><option>direct</option><option>enterprise</option>
+  </select>
+  <label for="residentKey">residentKey</label>
+  <select id="residentKey">
+    <option>discouraged</option><option>preferred</option><option>required</option>
+  </select>
+  <label for="userVerification">userVerification</label>
+  <select id="userVerification">
+    <option>discouraged</option><option>preferred</option><option>required</option>
+  </select>
+  <label for="attachment">authenticatorAttachment</label>
+  <select id="attachment">
+    <option value="">(any)</option><option>cross-platform</option><option>platform</option>
+  </select>
+  <label for="algs">pubKeyCredParams</label>
+  <select id="algs">
+    <option value="-7">ES256 only</option>
+    <option value="-7,-257">ES256 + RS256</option>
+    <option value="-7,-257,-8">ES256 + RS256 + EdDSA</option>
+  </select>
+  <label for="timeout">timeout (seconds)</label>
+  <input id="timeout" type="number" value="120" min="5" max="600">
+  <div class="check"><input type="checkbox" id="credProps" checked><span>Request credProps extension</span></div>
+  <div class="check"><input type="checkbox" id="hintKey"><span>hints: security-key</span></div>
+</div>
+
+<div class="card">
+  <h2>Run</h2>
+  <div class="row">
+    <button class="primary" id="btnReg" onclick="doRegister()">Register</button>
+    <button id="btnAuth" onclick="doAuth(false)">Sign in (discoverable)</button>
+    <button id="btnAuth2" onclick="doAuth(true)">Sign in (stored ID)</button>
+  </div>
+  <p id="status"></p>
+  <div class="row">
+    <button onclick="copyLog()">Copy log</button>
+    <button onclick="clearLog()">Clear</button>
+    <button onclick="forgetCred()">Forget stored ID</button>
+  </div>
+</div>
+
+<div class="card">
+  <h2>Log</h2>
+  <pre id="log"></pre>
+</div>
+
+<div class="card env"><pre id="env"></pre></div>
+
+<script>
+'use strict';
+const $ = id => document.getElementById(id);
+const logEl = $('log'), statusEl = $('status');
+let ticker = null, t0 = 0;
+
+/* ---------- helpers ---------- */
+const hex = b => Array.from(new Uint8Array(b), x => x.toString(16).padStart(2, '0')).join('');
+function b64u(b) {
+  let s = ''; new Uint8Array(b).forEach(x => s += String.fromCharCode(x));
+  return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+function fromB64u(s) {
+  s = s.replace(/-/g, '+').replace(/_/g, '/'); while (s.length % 4) s += '=';
+  const bin = atob(s), u = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i);
+  return u;
+}
+const rand = n => crypto.getRandomValues(new Uint8Array(n));
+function log(msg) {
+  const ts = new Date().toLocaleTimeString();
+  logEl.textContent += `[${ts}] ${msg}\n`;
+}
+function setStatus(msg, cls) { statusEl.textContent = msg; statusEl.className = cls || ''; }
+function busy(on) {
+  ['btnReg', 'btnAuth', 'btnAuth2'].forEach(id => $(id).disabled = on);
+  if (on) {
+    t0 = performance.now();
+    ticker = setInterval(() => setStatus(`Waiting for authenticator… ${((performance.now() - t0) / 1000).toFixed(0)}s`), 500);
+  } else { clearInterval(ticker); ticker = null; }
+}
+const elapsed = () => ((performance.now() - t0) / 1000).toFixed(2) + 's';
+
+/* ---------- minimal CBOR decoder ---------- */
+function cborDecode(buf, start = 0) {
+  const v = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+  let o = start;
+  const len = ai => {
+    if (ai < 24) return ai;
+    if (ai === 24) return v.getUint8(o++);
+    if (ai === 25) { const x = v.getUint16(o); o += 2; return x; }
+    if (ai === 26) { const x = v.getUint32(o); o += 4; return x; }
+    if (ai === 27) { const x = Number(v.getBigUint64(o)); o += 8; return x; }
+    throw new Error('Unsupported CBOR length');
+  };
+  const item = () => {
+    const ib = v.getUint8(o++), mt = ib >> 5, ai = ib & 31;
+    switch (mt) {
+      case 0: return len(ai);
+      case 1: return -1 - len(ai);
+      case 2: { const n = len(ai); const b = buf.slice(o, o + n); o += n; return b; }
+      case 3: { const n = len(ai); const s = new TextDecoder().decode(buf.slice(o, o + n)); o += n; return s; }
+      case 4: { const n = len(ai), a = []; for (let i = 0; i < n; i++) a.push(item()); return a; }
+      case 5: { const n = len(ai), m = new Map(); for (let i = 0; i < n; i++) { const k = item(); m.set(k, item()); } return m; }
+      case 7:
+        if (ai === 20) return false; if (ai === 21) return true; if (ai === 22) return null; if (ai === 23) return undefined;
+        throw new Error('Unsupported CBOR simple/float');
+      default: throw new Error('Unsupported CBOR type ' + mt);
+    }
+  };
+  const value = item();
+  return { value, end: o };
+}
+
+function parseAuthData(ad) {
+  const u = new Uint8Array(ad), dv = new DataView(u.buffer, u.byteOffset, u.byteLength);
+  const flags = u[32];
+  const out = {
+    rpIdHash: hex(u.slice(0, 32)),
+    flags: {
+      UP: !!(flags & 1), UV: !!(flags & 4), BE: !!(flags & 8), BS: !!(flags & 16),
+      AT: !!(flags & 64), ED: !!(flags & 128), raw: '0x' + flags.toString(16).padStart(2, '0')
+    },
+    counter: dv.getUint32(33)
+  };
+  let o = 37;
+  if (out.flags.AT) {
+    out.aaguid = hex(u.slice(o, o + 16)); o += 16;
+    const idLen = dv.getUint16(o); o += 2;
+    out.credentialId = b64u(u.slice(o, o + idLen)); out.credentialIdBytes = idLen; o += idLen;
+    try {
+      const r = cborDecode(u, o); o = r.end;
+      const k = r.value;
+      out.publicKey = { kty: k.get(1), alg: k.get(3), crv: k.get(-1) };
+    } catch (e) { out.publicKeyError = String(e); }
+  }
+  if (out.flags.ED) {
+    try { const r = cborDecode(u, o); out.extensions = Array.from(r.value.keys()); } catch (e) { out.extensionsError = String(e); }
+  }
+  return out;
+}
+
+/* ---------- presets ---------- */
+function preset(name) {
+  const set = (id, v) => $(id).value = v;
+  if (name === 'google') {
+    set('attestation', 'direct'); set('residentKey', 'required'); set('userVerification', 'required');
+    set('attachment', ''); set('algs', '-7,-257'); $('credProps').checked = true; $('hintKey').checked = false;
+  } else if (name === 'microsoft') {
+    set('attestation', 'none'); set('residentKey', 'required'); set('userVerification', 'required');
+    set('attachment', ''); set('algs', '-7,-257'); $('credProps').checked = true; $('hintKey').checked = false;
+  } else {
+    set('attestation', 'none'); set('residentKey', 'preferred'); set('userVerification', 'preferred');
+    set('attachment', ''); set('algs', '-7'); $('credProps').checked = false; $('hintKey').checked = false;
+  }
+  log(`Preset applied: ${name}`);
+}
+
+/* ---------- stored credential ---------- */
+function saveCred(id) { try { localStorage.setItem('webauthn-test-cred', id); } catch (e) {} }
+function loadCred() { try { return localStorage.getItem('webauthn-test-cred'); } catch (e) { return null; } }
+function forgetCred() { try { localStorage.removeItem('webauthn-test-cred'); } catch (e) {} log('Stored credential ID cleared (the passkey itself stays on the authenticator).'); }
+
+/* ---------- register ---------- */
+async function doRegister() {
+  if (!window.PublicKeyCredential) { setStatus('WebAuthn not supported in this browser.', 'bad'); return; }
+  const algs = $('algs').value.split(',').map(a => ({ type: 'public-key', alg: Number(a) }));
+  const sel = { residentKey: $('residentKey').value, userVerification: $('userVerification').value,
+                requireResidentKey: $('residentKey').value === 'required' };
+  if ($('attachment').value) sel.authenticatorAttachment = $('attachment').value;
+  const opts = {
+    challenge: rand(32),
+    rp: { name: 'WebAuthn Tester', id: location.hostname },
+    user: { id: rand(16), name: 'tester@example.com', displayName: 'Test User' },
+    pubKeyCredParams: algs,
+    authenticatorSelection: sel,
+    attestation: $('attestation').value,
+    timeout: Number($('timeout').value) * 1000
+  };
+  if ($('credProps').checked) opts.extensions = { credProps: true };
+  if ($('hintKey').checked) opts.hints = ['security-key'];
+
+  log('--- REGISTER ---');
+  log('Options: ' + JSON.stringify({ ...opts, challenge: '<32 random bytes>', user: { ...opts.user, id: '<16 random bytes>' } }));
+  busy(true);
+  try {
+    const cred = await navigator.credentials.create({ publicKey: opts });
+    const t = elapsed();
+    busy(false);
+    const r = cred.response;
+    const att = cborDecode(new Uint8Array(r.attestationObject)).value;
+    const ad = parseAuthData(att.get('authData'));
+    const stmt = att.get('attStmt');
+    log(`SUCCESS in ${t}`);
+    log(`Credential ID (${ad.credentialIdBytes} bytes): ${ad.credentialId}`);
+    log(`attestationObject size: ${r.attestationObject.byteLength} bytes`);
+    log(`fmt: ${att.get('fmt')}  | attStmt keys: ${stmt && stmt.size ? Array.from(stmt.keys()).join(', ') : '(empty)'}`);
+    if (stmt && stmt.get('x5c')) log(`x5c certificates: ${stmt.get('x5c').length}`);
+    if (stmt && stmt.has('alg')) log(`attStmt alg: ${stmt.get('alg')}`);
+    log(`AAGUID: ${ad.aaguid}`);
+    log(`Flags: ${JSON.stringify(ad.flags)}  counter: ${ad.counter}`);
+    if (ad.publicKey) log(`Public key: kty=${ad.publicKey.kty} alg=${ad.publicKey.alg} crv=${ad.publicKey.crv}`);
+    if (ad.extensions) log(`Authenticator extensions: ${ad.extensions.join(', ')}`);
+    try { if (r.getTransports) log(`Transports: ${JSON.stringify(r.getTransports())}`); } catch (e) {}
+    try { const ext = cred.getClientExtensionResults(); log(`Client extension results: ${JSON.stringify(ext)}`); } catch (e) {}
+    log(`authenticatorAttachment: ${cred.authenticatorAttachment || '(not reported)'}`);
+    saveCred(ad.credentialId);
+    setStatus(`Registered OK in ${t}`, 'ok');
+  } catch (e) {
+    const t = elapsed(); busy(false);
+    log(`FAILED after ${t}: ${e.name}: ${e.message}`);
+    setStatus(`${e.name} after ${t}`, 'bad');
+  }
+}
+
+/* ---------- authenticate ---------- */
+async function doAuth(useStored) {
+  if (!window.PublicKeyCredential) { setStatus('WebAuthn not supported in this browser.', 'bad'); return; }
+  const opts = {
+    challenge: rand(32),
+    rpId: location.hostname,
+    userVerification: $('userVerification').value,
+    timeout: Number($('timeout').value) * 1000
+  };
+  if (useStored) {
+    const id = loadCred();
+    if (!id) { setStatus('No stored credential ID. Register first.', 'bad'); return; }
+    opts.allowCredentials = [{ type: 'public-key', id: fromB64u(id), transports: ['usb', 'nfc', 'ble', 'hybrid'] }];
+  }
+  if ($('hintKey').checked) opts.hints = ['security-key'];
+  log(`--- SIGN IN (${useStored ? 'stored credential ID' : 'discoverable, no allowCredentials'}) ---`);
+  busy(true);
+  try {
+    const a = await navigator.credentials.get({ publicKey: opts });
+    const t = elapsed(); busy(false);
+    const r = a.response;
+    const ad = parseAuthData(r.authenticatorData);
+    log(`SUCCESS in ${t}`);
+    log(`Credential ID: ${a.id}`);
+    log(`Flags: ${JSON.stringify(ad.flags)}  counter: ${ad.counter}`);
+    log(`userHandle: ${r.userHandle && r.userHandle.byteLength ? r.userHandle.byteLength + ' bytes' : '(none)'}`);
+    log(`signature: ${r.signature.byteLength} bytes (not verified here)`);
+    log(`authenticatorAttachment: ${a.authenticatorAttachment || '(not reported)'}`);
+    setStatus(`Signed in OK in ${t}`, 'ok');
+  } catch (e) {
+    const t = elapsed(); busy(false);
+    log(`FAILED after ${t}: ${e.name}: ${e.message}`);
+    setStatus(`${e.name} after ${t}`, 'bad');
+  }
+}
+
+/* ---------- misc ---------- */
+function clearLog() { logEl.textContent = ''; setStatus(''); }
+async function copyLog() {
+  try { await navigator.clipboard.writeText(logEl.textContent); setStatus('Log copied.', 'ok'); }
+  catch (e) {
+    const r = document.createRange(); r.selectNodeContents(logEl);
+    const s = getSelection(); s.removeAllRanges(); s.addRange(r);
+    setStatus('Select-all done. Use Copy from the iOS menu.', '');
+  }
+}
+(async function env() {
+  const lines = [];
+  lines.push('Origin: ' + location.origin + (isSecureContext ? '' : '  (NOT a secure context)'));
+  lines.push('WebAuthn: ' + (window.PublicKeyCredential ? 'yes' : 'NO'));
+  try {
+    if (window.PublicKeyCredential && PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable)
+      lines.push('Platform authenticator: ' + await PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable());
+    if (window.PublicKeyCredential && PublicKeyCredential.isConditionalMediationAvailable)
+      lines.push('Conditional UI: ' + await PublicKeyCredential.isConditionalMediationAvailable());
+  } catch (e) {}
+  lines.push('UA: ' + navigator.userAgent);
+  $('env').textContent = lines.join('\n');
+})();
+preset('google');
+</script>
+</body>
+</html>
